@@ -1,0 +1,40 @@
+name: Vizer_Build
+on:
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: 'Log level'
+        required: false
+        default: 'warning'
+        type: choice
+        options:
+        - info
+        - warning
+        - debug
+      tags:
+        description: 'Test scenario tags'
+        required: false
+        type: boolean
+      environment:
+        description: 'Environment to run tests against'
+        type: environment
+        required: false
+  push:
+    branches: [ "main" ]
+
+jobs:
+  DockerBuild:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Login to DockerHub
+      uses: docker/login-action@v2.1.0
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    - name: Docker Build
+      uses: docker/build-push-action@v4.0.0
+      with: 
+        file: ./Dockerfile.egl
+        tags: hiteshdutt/3dviz:${{ github.run_id }}
+        push: true
