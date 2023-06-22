@@ -1,4 +1,4 @@
-name: Vizer_Build
+name: Vizer_Build_osmesa
 on:
   workflow_dispatch:
     inputs:
@@ -35,6 +35,6 @@ jobs:
     - name: Docker Build
       uses: docker/build-push-action@v4.0.0
       with: 
-        file: ./Dockerfile.egl
-        tags: hiteshdutt/3dviz:${{ github.run_id }}
+        file: ./Dockerfile.osmesa
+        tags: hiteshdutt/3dviz-osmesa:${{ github.run_id }}
         push: true
