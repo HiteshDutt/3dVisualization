@@ -9,6 +9,7 @@ import asyncio
 from paraview.simple import LoadPlugins
 LoadPlugins(os.path.join(os.path.dirname(__file__), 'plugins', 'outline_filter.py'))
 LoadPlugins(os.path.join(os.path.dirname(__file__), 'plugins', 'extract_voi.py'))
+LoadPlugins(os.path.join(os.path.dirname(__file__), 'plugins', 'color_mappyer.py'))
 
 from . import utils, views, readers
 log = utils.get_logger(__name__)
@@ -39,7 +40,7 @@ def exec():
     server.cli.add_argument('--force-view', help="force view type (primarily for debugging)", default=None,
         choices=views.get_view_types())
     server.cli.add_argument('--link-views', help='link interaction between views of same time (default: True)', default=False, action='store_true')
-
+    # server.cli.add_argument('--segmentation', help='if supported, enable segmentation support (default: False)', default=False, action='store_true')
     # parse args
     args = server.cli.parse_known_args()[0]
     

@@ -1,10 +1,12 @@
 r"""quad view"""
 
-from .base import Base
+from .base import Base, Layout
+from .segmentation import Segmentation
 from vizer import utils
 from vizer.readers import RawConfig
 import os.path
 import re
+import numpy
 
 from paraview import simple, vtk
 from trame.widgets import vuetify, paraview, html
@@ -98,15 +100,29 @@ class UIBuilder:
                     __properties=[("v_bind", "v-bind"), ("v_on", "v-on")])
             html.Pre("Restore")
 
+    def select_button(self, view, axis):
+        if view._segmentation_view is None:
+            return
+        with vuetify.VTooltip(left=True):
+            with vuetify.Template(v_slot_activator="{on, attrs}"):
+                vuetify.VIcon("mdi-select-drag",
+                    click=lambda **_: view.show_segmentation_dialog(axis),
+                    classes="mr-4",
+                    v_bind="attrs",
+                    v_on="on",
+                    __properties=[("v_bind", "v-bind"), ("v_on", "v-on")])
+            html.Pre("Select Regions")
+
     def slice_slider(self, view, axis):
         vuetify.VSlider(dense=True, hide_details=True,
             min=(f'{view.id}_slice_min_{axis}', 0), max=(f'{view.id}_slice_max_{axis}', 0),
             v_model=(f'{view.id}_slice_{axis}', 0))
 
+
 class Quad(Base):
     """A quad view that renders the dataset in four views."""
-    def __init__(self, filename, opts, **kwargs) -> None:
-        super().__init__(filename, opts)
+    def __init__(self, meta, opts, **kwargs) -> None:
+        super().__init__(meta, opts)
         self._ui_builder = kwargs.get('ui_builder', UIBuilder())
         self._views = [None, None, None, None]
         self._html_views = [None, None, None, None]
@@ -134,18 +150,12 @@ class Quad(Base):
         self._state['no_maximized'] = True
         self._block_update = False
 
-        # load the color categories, if present
-        self.load_categories()
+        # self._segmentation_view = Segmentation(meta, opts, parent=self) if opts.segmentation else None
+        self._segmentation_view = None
 
     @property
     def state(self):
         return self._state
-
-    def get_scalar_name(self):
-        """returns the scalar array name"""
-        scalars = self.producer.GetDataInformation().GetPointDataInformation().GetAttributeInformation(
-            vtk.vtkDataSetAttributes.SCALARS)
-        return scalars.GetName()
 
     def update_client_state(self):
         """updates the client with the current state."""
@@ -176,7 +186,7 @@ class Quad(Base):
     @property
     def annotations_txt(self):
         """returns the annotations for this view."""
-        annotations = self._annotations[:]
+        annotations = list(self.meta.raw_config.annotations if self.meta.raw_config is not None else [])
         annotations.append(f'subsampling: {self._active_subsampling_factor}X')
         return '\n'.join(annotations)
 
@@ -211,31 +221,6 @@ class Quad(Base):
         await self.load_dataset(async_only=True)
         self._block_update = False
 
-    def load_categories(self):
-        """Loads the color categories from meta data file associated with the dataset."""
-        self._categories = {}
-        self._annotations = []
-        meta_filename = f'{os.path.splitext(self.meta.filename)[0]}.txt'
-
-        if not os.path.exists(meta_filename):
-            return
-        with open(meta_filename, 'r') as f:
-            for line in f.readlines():
-                line = line.strip()
-                lline = line.lower()
-                if lline.startswith('segorder:'):
-                    lline = lline[len('segorder:'):]
-                    regex = r"(?:\s*(?P<value>\d+)-(?P<text>[^,]+),?)"
-                    matches = re.finditer(regex, lline)
-                    self._categories = dict([(int(m.group('value')), m.group('text')) for m in matches])
-                elif lline.startswith('samplename:'):
-                    line = 'sample name: ' + line[len('samplename:'):].strip()
-                    self._annotations.append(line)
-                elif lline.startswith('segmented'):
-                    line = 'segmented: ' + line[len('segmented'):].strip()
-                    self._annotations.append(line)
-        log.info(f'{self.id}: Loaded categories: {self._categories}')
-
     def _copy_slice_camera(self, view):
         """Links the interaction of the given axis to the other views."""
         fp = view.CameraFocalPoint
@@ -265,6 +250,17 @@ class Quad(Base):
             self._state['max_col'] = -1
         self.update_client_state()
         Base.propagate_changes_to_linked_views(self)
+
+    def show_segmentation_dialog(self, axis):
+        """toggles the segmentation visibility."""
+        assert self._segmentation_view is not None
+        # update slice
+        self._segmentation_view.setup(\
+            axis=axis,
+            slice=self._state[f'slice_{axis}'],
+            subsampling_factor=self._active_subsampling_factor,
+            dataset=self._slices[axis].GetClientSideObject().GetOutputDataObject(0))
+        self.layout.show_dialog()
 
     def create_slice_view(self, axis:int):
         """Creates a slice view for the given axis."""
@@ -331,9 +327,13 @@ class Quad(Base):
                 with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 0'):
                     self._ui_builder.slice_slider(self, 0)
                 with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 0', cols="auto"):
+                    self._ui_builder.select_button(self, axis=0)
+                with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 0', cols="auto"):
                     self._ui_builder.maximize_button(self, 0, 0)
                 with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 1'):
                     self._ui_builder.slice_slider(self, 1)
+                with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 1', cols="auto"):
+                    self._ui_builder.select_button(self, axis=1)
                 with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 1', cols="auto"):
                     self._ui_builder.maximize_button(self, 0, 1)
 
@@ -350,6 +350,8 @@ class Quad(Base):
             with vuetify.VRow(v_if=f'{self._id}_no_maximized || {self.id}_max_row == 1', no_gutters=True, classes="shrink"):
                 with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 0'):
                     self._ui_builder.slice_slider(self, 2)
+                with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 0', cols="auto"):
+                    self._ui_builder.select_button(self, axis=2)
                 with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 0', cols="auto"):
                     self._ui_builder.maximize_button(self, 1, 0)
                 with vuetify.VCol(v_if=f'{self._id}_no_maximized || {self.id}_max_col == 1'):
@@ -377,6 +379,11 @@ class Quad(Base):
                         v_on="on",
                         __properties=[("v_bind", "v-bind"), ("v_on", "v-on")])
                     html.Pre("Reset zoom for all views")
+
+        # setup popup dialog for selecting regions
+        if self._segmentation_view is not None:
+            with self.layout.dialog:
+                self._segmentation_view.widget
 
     def update_pipeline(self):
         # update domains based on current dataset.
@@ -435,6 +442,7 @@ class Quad(Base):
         self._lut.RGBPoints = [0, 0.2, 0.2, 0.2, 1, 1, 1, 1]
 
         # create the pipeline
+        self._color_mapyer = simple.ColorMappyer(Input=self.producer)
         self.create_outline_pipelines()
         for axis in range(3):
             self.create_slice_pipeline(axis)
@@ -458,7 +466,7 @@ class Quad(Base):
         log.info(f'{self.id}: creating slice pipeline for axis {axis} with extent {ext}')
 
         # create the slice
-        slice = simple.ExtractVOI(Input=self.producer, VOI=ext)
+        slice = simple.ExtractVOI(Input=self._color_mapyer, VOI=ext)
         self._slices[axis] = slice
 
         # set the slice to the middle of the axis
@@ -469,6 +477,7 @@ class Quad(Base):
         simple.ColorBy(sliceDisplay, ('POINTS', self.get_scalar_name()))
         sliceDisplay.SetRepresentationType('Slice')
         sliceDisplay.LookupTable = self._lut
+        sliceDisplay.MapScalars = self.get_map_scalars()
 
         # add annotation text
         text = simple.Text()
@@ -478,12 +487,17 @@ class Quad(Base):
         textDisplay.FontSize = 16
         textDisplay.FontFamily = 'Arial'
 
+        # update outline actors
+        setattr(self._outline, CONSTANTS.OutlinePropertyNames[axis], [val])
+        self._outline.UpdateVTKObjects()
+
         state = get_server().state
         @state.change(f'{self.id}_slice_{axis}')
         def slice_changed(**kwargs):
             val = kwargs[f'{self.id}_slice_{axis}']
             self._state[f'slice_{axis}'] = self._slices[axis].VOI[axis*2] = self._slices[axis].VOI[axis*2+1] = val
             setattr(self._outline, CONSTANTS.OutlinePropertyNames[axis], [val])
+            self._outline.UpdateVTKObjects()
             text.Text = f'{CONSTANTS.AxisNames[axis]}: {self._active_subsampling_factor * val}'
             self.update_html_views()
             Base.propagate_changes_to_linked_views(self)
@@ -509,18 +523,20 @@ class Quad(Base):
             simple.ColorBy(slice_display, ('POINTS', self.get_scalar_name()))
             slice_display.SetRepresentationType('Slice')
             slice_display.LookupTable = self._lut
+            slice_display.MapScalars = self.get_map_scalars()
             slice_displays[axis] = slice_display
 
         # create 6 outer slice displays
         ext = self.producer.GetDataInformation().GetExtent()
         for axis in range(3):
             for side in range(2):
-                voi = simple.ExtractVOI(Input=self.producer, VOI=ext)
+                voi = simple.ExtractVOI(Input=self._color_mapyer, VOI=ext)
                 voi.VOI[axis*2] = voi.VOI[axis*2+1] = ext[axis*2+side]
                 slice_display = simple.Show(voi, view)
                 simple.ColorBy(slice_display, ('POINTS', self.get_scalar_name()))
                 slice_display.SetRepresentationType('Slice')
                 slice_display.LookupTable = self._lut
+                slice_display.MapScalars = self.get_map_scalars()
                 simple.Hide(voi, view)
                 self._outer_slices[axis*2+side] = voi
         self._update_3d_slice_visibility()
@@ -563,32 +579,41 @@ class Quad(Base):
         for view in self._views:
             outlineDisplay = simple.Show(self._outline, view)
             outlineDisplay.SetRepresentationType('Wireframe')
-            outlineDisplay.MapScalars = 0
+            outlineDisplay.MapScalars = 0 # directly interpret scalars as colors
             outlineDisplay.ColorArrayName = ['POINTS', 'colors']
             outlineDisplay.LineWidth = 4
+
+    def get_map_scalars(self):
+        """Returns the map scalars value through LUT or not."""
+        if self.meta.raw_config is not None and self.meta.raw_config.colormap is not None:
+            return False
+        return True
 
     def update_color_map(self):
         """Updates the color map."""
         log.info(f'{self.id}: updating color map')
-        if self._categories:
-            self._lut.InterpretValuesAsCategories = True
-            self._lut.AnnotationsInitialized = True
-            annotations = []
-            for seg, label in self._categories.items():
-                annotations.append(str(seg))
-                annotations.append(label)
-            self._lut.Annotations = annotations
-            count = min(11, max(3, len(self._categories)))
-            self._lut.ApplyPreset(f'Brewer Diverging Spectral ({count})', True)
+
+        # get scalar bar in 3D view
+        sb = simple.GetScalarBar(self._lut, self._views[3])
+        sb.ComponentTitle = ''
+
+        if self.meta.raw_config is not None and self.meta.raw_config.colormap is not None:
+            log.info(f'{self.id}: using categorical color map (with color_mappyer)')
+            sb.Visibility = False
+
+            # update color mapyer
+            # using this direct API call since the XML wrapping for this is broken
+            self._color_mapyer.GetClientSideObject().SetColors(self.meta.raw_config.colormap['color'].flatten())
+            self._color_mapyer.GetClientSideObject().SetScalars(self.meta.raw_config.colormap['scalar'].flatten())
+            assert self.get_map_scalars() == False
         else:
             drange = self.producer.GetDataInformation().GetArrayInformation(self.get_scalar_name(), vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS).GetComponentRange(0)
             log.info(f'{self.id}: range: {drange}')
             self._lut.InterpretValuesAsCategories = False
+            self._lut.ApplyPreset('Grayscale', True)
+            self._lut.RGBPoints = [0, 0.2, 0.2, 0.2, 1, 1, 1, 1]
             self._lut.RescaleTransferFunction(drange[0], drange[1])
-
-
-        # show scalar bar in 3D view
-        sb = simple.GetScalarBar(self._lut, self._views[3])
-        sb.Visibility = True
-        sb.Title = 'segments' if self._categories else ''
-        sb.ComponentTitle = ''
+            sb.Visibility = True
+            sb.Title = ''
+            self._color_mapyer.Colors = []
+            self._color_mapyer.Scalars = []

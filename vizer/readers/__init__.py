@@ -1,7 +1,9 @@
 from os import path, cpu_count
 from vizer import utils
+import ast
 import re
 import asyncio
+import json
 import numpy
 from quantiphy import Quantity
 
@@ -20,8 +22,14 @@ class RawConfig:
         self.unsigned = False
         self.spacing = None
 
+        # this is a list of text annotation to be added to the view
+        self.annotations = []
+
+        # this is categorical colormap to be used for mapping scalars
+        self.colormap = None
+
     def __str__(self) -> str:
-        return f'bits: {self.bits}, unsigned: {self.unsigned}, dims: {self.dims}, spacing: {self.spacing:q} ({self.spacing.real})'
+        return ', '.join([f'{k}: {v}' for k, v in vars(self).items()])
 
     def is_valid(self) -> bool:
         return self.dims[0] * self.dims[1] * self.dims[2] > 0 and self.bits > 0
@@ -47,6 +55,10 @@ class RawConfig:
     @property
     def vtk_spacing(self):
         return [1.0, 1.0, 1.0]
+    
+    @property
+    def vtk_origin(self):
+        return [0.0, 0.0, 0.0]
 
     @property
     def dtype(self):
@@ -59,6 +71,20 @@ class RawConfig:
     @staticmethod
     def extract_config(filename):
         """extracts metadata from the file's name"""
+        # see if there's a json file with the same name, if so we use that to extract metadata
+        json_file = path.splitext(filename)[0] + '.json'
+        if path.isfile(json_file):
+            log.info(f'extracting metadata from json file: {json_file}')
+            return RawConfig.extract_config_from_json(json_file, filename)
+
+        # next, try legacy txt file format
+        txt_file = path.splitext(filename)[0] + '.txt'
+        if path.isfile(txt_file):
+            log.info(f'extracting metadata from txt file: {txt_file}')
+            return RawConfig.extract_config_from_txt(txt_file, filename)
+
+        # extract metadata from filename itself
+        log.info(f'extracting metadata from filename: {filename}')
         reg = re.compile(r"_(?P<bits>\d+)b(?P<unsigned>u?)_?.*_(?P<xdim>\d+)x(?P<ydim>\d+)x(?P<zdim>\d+)")
         m = reg.search(filename)
         if not m:
@@ -88,6 +114,119 @@ class RawConfig:
                 config.spacing = Quantity(f"{num} {unit}")
         return config if config.is_valid() else None
 
+    @staticmethod
+    def extract_config_from_json(filename, raw_filename):
+        json_data = json.load(open(filename))
+        volume_data = json_data.get('volumes', [{}])[0]
+        volume_filename = volume_data.get('volume_filename', None)
+        volume_metadata = volume_data.get('volume_metadata', {})
+
+        config = RawConfig()
+        config.dims[0] = int(volume_metadata.get('xdim', 0))
+        config.dims[1] = int(volume_metadata.get('ydim', 0))
+        config.dims[2] = int(volume_metadata.get('zdim', 0))
+        config.spacing = Quantity(str(volume_metadata.get('voxel', 1.0)) + 'um')
+
+        bitrate = volume_metadata.get('bitrate', 0)
+        if (m := re.search(r'^(?P<bits>\d+)b(?P<unsigned>u?)$', bitrate)) is not None:
+            groups = m.groupdict()
+            config.bits = int(groups.get('bits', 0))
+            config.unsigned = True if 'unsigned' in groups else False
+        else:
+            log.error(f'could not parse bitrate "{bitrate}"')
+            return None
+
+        config.annotations.append(f'filename: {volume_filename}')
+        config.annotations.append(f'dims: {"x".join([str(x) for x in config.dims])}')
+        config.annotations.append(f'bitrate: {bitrate}')
+        if 'type' in volume_metadata:
+            config.annotations.append(f'type: {volume_metadata["type"]}')
+
+        # process phase_metadata
+        if (phase_metadata := volume_data.get('phase_metadata', None)) is not None:
+            phases = phase_metadata.get('phases', [])
+            if type(phases) is not list:
+                phases = ast.literal_eval(phases)
+            phases = numpy.array(phases, dtype=config.dtype)
+            rgba_array = phase_metadata.get('rgba_array', [])
+            if type(rgba_array) is not list:
+                rgba_array = ast.literal_eval(rgba_array)
+            rgba_array = numpy.array(rgba_array, dtype=numpy.float32)
+            if len(phases) != len(rgba_array):
+                log.error(f'phases and rgba_array do not have the same length')
+            else:
+                assert rgba_array.shape[1] == 4
+                assert rgba_array.shape[0] == len(phases)
+
+                dtype = numpy.dtype([('scalar', config.dtype), ('color', numpy.float32, (4,))])
+                config.colormap = numpy.empty(len(phases), dtype=dtype)
+                config.colormap['scalar'] = phases
+                config.colormap['color'] = rgba_array
+
+        # log.info(f'extracted metadata: {config}')
+        return config if config.is_valid() else None
+    
+    @staticmethod
+    def extract_config_from_txt(filename, raw_filename):
+        config = RawConfig()
+        categories = None
+        with open(filename, 'r') as f:
+            for line in f.readlines():
+                if regex := re.search(r"^(?P<key>[^:]+):(?P<value>.*)$", line.strip()):
+                    groups = regex.groupdict()
+                    key = groups.get('key', '').strip().lower()
+                    value = groups.get('value', '').strip()
+                    if key == 'x-dimension':
+                        config.dims[0] = int(value)
+                    elif key == 'y-dimension':
+                        config.dims[1] = int(value)
+                    elif key == 'z-dimension':
+                        config.dims[2] = int(value)
+                    elif key == 'bitrate':
+                        if (m := re.search(r'^(?P<bits>\d+)b(?P<unsigned>u?)$', value)) is not None:
+                            groups = m.groupdict()
+                            config.bits = int(groups.get('bits', 0))
+                            config.unsigned = True if 'unsigned' in groups else False
+                        else:
+                            log.error(f'could not parse bitrate "{value}"')
+                            return None
+                    elif key == 'voxelsize(um)':
+                        config.spacing = Quantity(value + 'um')
+                    elif key == 'segorder':
+                        regex = r"(?:\s*(?P<value>\d+)-(?P<text>[^,]+),?)"
+                        matches = re.finditer(regex, value)
+                        categories = dict([(int(m.group('value')), m.group('text')) for m in matches])
+                    elif key == 'samplename':
+                        config.annotations.append(f'sample name: {value}')
+                    elif key == 'segmented':
+                        config.annotations.append(f'segmented: {value}')
+        if categories:
+            # build color map from categories
+            count = min(11, max(3, len(categories)))
+            preset = f'Brewer Diverging Spectral ({count})'
+            lut = simple.GetColorTransferFunction(f'temp_for_reader')
+            lut.InterpretValuesAsCategories = 1
+            annotations = []
+            for seg in categories:
+                annotations.append(str(seg))
+                annotations.append(str(seg))
+            lut.Annotations = annotations
+            lut.AnnotationsInitialized = 1
+            lut.ApplyPreset(preset, True)
+
+            colors = []
+            scalars = []
+            for seg in categories:
+                color = [0.0, 0.0, 0.0]
+                lut.GetClientSideObject().GetColor(seg, color)
+                colors.append([color[0], color[1], color[2], 1.0])
+                scalars.append(seg)
+
+            dtype = numpy.dtype([('scalar', config.dtype), ('color', numpy.float32, (4,))])
+            config.colormap = numpy.empty(len(categories), dtype=dtype)
+            config.colormap['scalar'] = numpy.array(scalars, dtype=config.dtype)
+            config.colormap['color'] = numpy.array(colors, dtype=numpy.float32)
+        return config if config.is_valid() else None
 
 class Metadata:
     """Metadata for a file."""
